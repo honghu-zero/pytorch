@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+    from ..choices import GridPolicy
     from ..ir import IRNode
     from .common import BlockShapeType
     from .simd_kernel_features import SIMDKernelFeatures
@@ -3544,6 +3545,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         TensorDescriptorOptions
     )
     transpose_discontiguous_tensor_descriptors_override: bool | None = None
+    # A capped launch grid (InductorChoices.triton_grid_policy), None for the kernel's
+    # stock grid. A subclass asks for one only if its own class body sets
+    # supports_grid_policy = True.
+    grid_policy: GridPolicy | None = None
+    supports_grid_policy: bool = True
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "supports_grid_policy" not in cls.__dict__:
+            cls.supports_grid_policy = False
 
     def __init__(
         self,
@@ -3613,6 +3624,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.cooperative_reduction:
             self.init_cooperative_reduction()
+
+        if self._grid_policy_eligible():
+            self.grid_policy = V.choices.triton_grid_policy(
+                self.features.with_tiling_scores(self.tiling_scores)
+            )
 
         self.codegen_range_tree()
 
@@ -4112,6 +4128,69 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 # For looped reductions, indexing is deferred to the innermost loop.
                 self.codegen_reduction_indices(self.body)
+
+    def _grid_policy_eligible(self) -> bool:
+        """Whether TritonKernel asks the choices handler for a capped grid. It asks for
+        pointwise kernels and looped reductions of TritonKernel itself (or of a subclass
+        whose own class body sets supports_grid_policy = True) with one x dimension and at
+        most one reduction dimension. It does not ask for:
+        - cooperative reductions and combo kernels, which assign work by program id
+          themselves;
+        - persistent reductions, whose heuristic has no capped candidates (mix-order
+          reductions and kernels that drop their x dimension, no_x_dim, are persistent);
+        - nested or staged reductions, which add iteration roots during codegen;
+        - native matmuls, kernels with a fixed config, and kernels with a hint override,
+          which changes the sizes they are benchmarked at;
+        - kernels with a single x element, which have one block whatever the cap.
+        It asks for no kernel at all:
+        - while triton.use_block_ptr, triton.use_tensor_descriptor or
+          triton.multi_kernel is on;
+        - under the FX IR wrapper (config.fx_wrapper, or the graph's own fx_wrapper),
+          which evaluates grids in Python on symbolic sizes, where CappedGrid1D's min()
+          fails;
+        - while combo kernels autotune their sub-kernels at compile time (combo_kernels with
+          combo_kernel_compile_time_autotune), which benchmarks each sub-kernel as a
+          standalone TritonKernel and copies the winner's XBLOCK and warps into a combo
+          kernel whose sub-kernels have no capped grid.
+        """
+        return (
+            self.supports_grid_policy
+            and [tree.prefix for tree in self.range_trees if not tree.is_reduction]
+            == ["x"]
+            and self.num_reduction_dims <= 1
+            and self.numels["x"] != 1
+            and not (self.persistent_reduction or self.cooperative_reduction)
+            and self.features.indexing_node_schedule is self.features.node_schedule
+            and not (self.is_combo_kernel or self.is_native_matmul)
+            and self.fixed_config is None
+            and self.hint_override is None
+            and not (
+                config.triton.use_block_ptr
+                or config.triton.use_tensor_descriptor
+                or config.triton.multi_kernel
+                or config.fx_wrapper
+                # a graph handler that is not a GraphLowering may lack fx_wrapper
+                or getattr(V.graph, "fx_wrapper", False)
+                or (config.combo_kernels and config.combo_kernel_compile_time_autotune)
+            )
+        )
+
+    def _grid_stride_blocks(self, programs: int) -> tuple[str, bool]:
+        """The x block count that a capped kernel's loop runs to, and whether it casts
+        xnumel to int64. `(xnumel - 1) // XBLOCK + 1` equals `tl.cdiv(xnumel, XBLOCK)`
+        for xnumel of at least 1 (otherwise the grid is empty) and, unlike cdiv's
+        `xnumel + XBLOCK - 1`, cannot overflow int32.
+
+        The loop counter takes the bound's type and steps past the last block by up to
+        `programs`, so xnumel is cast to int64 unless xnumel plus `programs` is known to
+        fit int32. The cast also lets Triton divide a constant xnumel from 2**31 to
+        2**32 - 1, which it types as uint32, by the int32 XBLOCK.
+        """
+        if V.graph.sizevars.statically_known_leq(
+            self.numels["x"] + programs, 2**31 - 1
+        ):
+            return "(xnumel - 1) // XBLOCK + 1", False
+        return "(xnumel.to(tl.int64) - 1) // XBLOCK + 1", True
 
     def need_numel_args(self):
         """
@@ -5047,6 +5126,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _enable_pdl_codegen():
+        if isinstance(V.kernel, TritonKernel) and V.kernel.grid_policy is not None:
+            # The programs of a capped kernel loop over its blocks: an early launch of
+            # the next kernel would take the SMs that the cap leaves free.
+            return False
         enable_pdl = torch._inductor.config.triton.enable_pdl
         selective_pdl = not enable_pdl and torch._inductor.config.nvgemm_pdl != "0"
         if selective_pdl:
@@ -7896,6 +7979,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         }
         if self.mix_order_reduction:
             out["RSPLIT_SIZE"] = self.rsplit_size
+        if self.grid_policy is not None:
+            out["grid_cap"] = self.grid_policy.programs
+            if self.grid_policy.max_xblock is not None:
+                out["grid_max_xblock"] = self.grid_policy.max_xblock
         if config.deterministic or config.test_configs.force_filter_reduction_configs:
             out["has_loadstore_with_contiguous_rdim"] = (
                 self.has_load_with_contiguous_rdim
@@ -8442,6 +8529,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if n != 1:
                 raise AssertionError(f"expected n == 1, got {n}")
             return triton_heuristics.CooperativeReductionGrid
+        elif self.grid_policy is not None:
+            return triton_heuristics.CappedGrid1D
         elif n == 1:
             return triton_heuristics.Grid1D
         elif n == 2:
@@ -8588,6 +8677,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         block = f"{prefix.upper()}BLOCK"
         if self.fixed_config and block in self.fixed_config:
             return self.fixed_config[block]
+        if (
+            prefix == "x"
+            and self.grid_policy is not None
+            and self.grid_policy.max_xblock is not None
+        ):
+            # A capped pointwise kernel's configs go up to max_xblock, and a block
+            # raised for min_elem_per_thread up to the larger of max_xblock and
+            # TRITON_MAX_BLOCK["X"], where the runtime stops the raise; a looped
+            # reduction's configs and coordinate descent go up to TRITON_MAX_BLOCK["X"].
+            # That larger block bounds them all, and the runtime checks every capped
+            # candidate against it (check_capped_grid_config).
+            return max(self.grid_policy.max_xblock, TRITON_MAX_BLOCK["X"])
         return TRITON_MAX_BLOCK[prefix.upper()]
 
     def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
@@ -8795,9 +8896,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             block_size = (
                 f"{x.upper()}BLOCK" if not self.mix_order_reduction else "RSPLIT_SIZE"
             )
+            if self.grid_policy is not None and x == "x":
+                # A capped grid: each program loops over the x blocks, and the rest of
+                # the body, every reduction loop and store included, runs once per block.
+                bound, xnumel_to_int64 = self._grid_stride_blocks(
+                    self.grid_policy.programs
+                )
+                code.writeline(
+                    f"for x_block in tl.range(tl.program_id(0), {bound}, "
+                    "tl.num_programs(0)):"
+                )
+                code.do_indent()
+                # Inside the loop x_block < cdiv(xnumel, XBLOCK), so a block's last lane
+                # is below cdiv(xnumel, XBLOCK) * XBLOCK, which is at most 2**31 for an
+                # int32 xnumel because XBLOCK, a power of 2, divides 2**31: int32
+                # offsets do not wrap, as in the one-program-per-block kernels. The
+                # counter ends below cdiv(xnumel, XBLOCK) + programs, at most xnumel +
+                # programs, which _grid_stride_blocks keeps int32 only when that sum
+                # fits int32.
+                pid = (
+                    "x_block"
+                    if self.index_dtype == "tl.int32" and not xnumel_to_int64
+                    else f"x_block.to({self.index_dtype})"
+                )
+            else:
+                pid = self.iteration_ranges_get_pid(entry)
             code.writelines(
                 [
-                    f"{x}offset = {self.iteration_ranges_get_pid(entry)} * {block_size}",
+                    f"{x}offset = {pid} * {block_size}",
                     f"{entry.name} = {line}",
                 ]
             )

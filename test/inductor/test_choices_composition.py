@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 from torch._inductor import config
 from torch._inductor.choices import (
+    compose_inductor_choices,
     create_inductor_choices,
+    GridPolicy,
     InductorChoices,
     register_inductor_choices,
     registered_inductor_choices,
@@ -109,6 +111,14 @@ class NotChoices:
 
 class PlainChoices(InductorChoices):
     pass
+
+
+class GridChoices(InductorChoices):
+    def triton_grid_policy(self, features: Any) -> GridPolicy:
+        return GridPolicy(44)
+
+    def uuid(self) -> str:
+        return "grid"
 
 
 class StaticFalseChoices(InductorChoices):
@@ -419,6 +429,69 @@ class ChoicesCompositionTest(TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not implement uuid"):
             register_inductor_choices("plain", PlainChoices)
         self.assertEqual(registered_inductor_choices(), ())
+
+    def test_missing_uuid_inside_a_registered_composition_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "'grid:1' does not implement uuid"):
+            register_inductor_choices(
+                "grid",
+                lambda: compose_inductor_choices([GridChoices(), PlainChoices()]),
+            )
+        self.assertEqual(registered_inductor_choices(), ())
+
+    def test_compose_forwards_the_grid_policy_hook(self) -> None:
+        handler = compose_inductor_choices([GridChoices(), BetaChoices()])
+        self.assertEqual(handler.triton_grid_policy(object()), GridPolicy(44))
+        self.assertEqual(handler.get_config_heuristics().get_conv_configs(), "beta")
+        self.assertIsNone(
+            compose_inductor_choices(
+                [BetaChoices(), AlphaChoices()]
+            ).triton_grid_policy(object())
+        )
+
+    def test_compose_dispatches_to_the_first_override_in_order(self) -> None:
+        handler = compose_inductor_choices([AlphaChoices(3), BetaChoices()])
+        self.assertEqual(handler.customize_fused_kernel_name("k", ""), "k_alpha:3")
+        self.assertEqual(handler.get_config_heuristics().get_conv_configs(), "beta")
+        with self.assertLogs("torch._inductor.choices", level="WARNING") as logs:
+            first = compose_inductor_choices([SecondNameChoices(), AlphaChoices(3)])
+            self.assertEqual(first.customize_fused_kernel_name("k", ""), "k_second")
+        self.assertIn("customize_fused_kernel_name", "\n".join(logs.output))
+
+    def test_compose_keeps_the_hooks_of_a_composed_handler(self) -> None:
+        inner = compose_inductor_choices([AlphaChoices(3), BetaChoices()])
+        handler = compose_inductor_choices([UUIDChoices("u"), inner])
+        self.assertEqual(handler.customize_fused_kernel_name("k", ""), "k_alpha:3")
+        self.assertEqual(handler.get_config_heuristics().get_conv_configs(), "beta")
+        self.assertEqual(
+            handler.uuid(),
+            ("composed_inductor_choices", ("u", "alpha:_alpha:3", "beta")),
+        )
+
+    def test_registered_composed_handler_keeps_its_hooks(self) -> None:
+        register_inductor_choices(
+            "pair", lambda: compose_inductor_choices([AlphaChoices(3), BetaChoices()])
+        )
+        register_inductor_choices("uuid", lambda: UUIDChoices("u"))
+        handler = V.choices
+        self.assertEqual(handler.customize_fused_kernel_name("k", ""), "k_alpha:3")
+        self.assertEqual(handler.get_conv_configs(), "beta")
+        self.assertEqual(
+            handler.uuid(),
+            ("composed_inductor_choices", ("alpha:_alpha:3", "beta", "u")),
+        )
+
+    def test_compose_returns_a_single_handler_as_it_is(self) -> None:
+        alpha = AlphaChoices()
+        self.assertIs(compose_inductor_choices([alpha]), alpha)
+        # A single composed handler comes back rebuilt from the handlers it composes
+        inner = compose_inductor_choices([alpha, BetaChoices()])
+        self.assertEqual(compose_inductor_choices([inner]).uuid(), inner.uuid())
+
+    def test_compose_rejects_no_handlers_and_non_handlers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least one handler"):
+            compose_inductor_choices([])
+        with self.assertRaisesRegex(TypeError, "got NotChoices"):
+            compose_inductor_choices([AlphaChoices(), _as_choices(NotChoices())])
 
     def test_registration_replaces_in_place(self) -> None:
         register_inductor_choices("alpha", lambda: AlphaChoices(threshold=1))
