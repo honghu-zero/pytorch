@@ -209,22 +209,20 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             "max_autotune_pointwise"
         )
 
-        register_intensive = False
         loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
             "num_reduction", 0
         )
+        register_intensive = self._register_intensive(size_hints, loads_and_red)
 
-        device_major = triton_meta["device"].major
         warp_size = triton_meta["device"].warp_size_or_default
         # Kernels with per-row accumulators have room for larger reduction
         # blocks than the contiguous default.
         scalar_accumulators = AutotuneHint.SCALAR_ACCUMULATORS in inductor_meta.get(
             "autotune_hints", ()
         )
-        MAX_R0_BLOCK = 1024 if device_major is not None and device_major >= 10 else 2048
-        if size_hints["x"] >= 1024 and loads_and_red >= 10:
-            MAX_R0_BLOCK = 1024
-            register_intensive = True
+        MAX_R0_BLOCK = self._default_max_r0_block(
+            triton_meta["device"].major, register_intensive
+        )
 
         if triton_meta.get("native_matmul"):
             if len(size_hints) == 3:
@@ -382,6 +380,68 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         return self._finalize_configs(
             result_configs, make_config, size_hints, inductor_meta
         )
+
+    @staticmethod
+    def _register_intensive(size_hints: dict[str, int], loads_and_red: int) -> bool:
+        """An x size hint of at least 1,024 with at least 10 loads and reductions."""
+        return size_hints["x"] >= 1024 and loads_and_red >= 10
+
+    @staticmethod
+    def _default_max_r0_block(
+        device_major: int | None, register_intensive: bool
+    ) -> int:
+        """get_configs' default R0_BLOCK limit: 1,024 on GPUs of compute capability 10
+        or above and for register-intensive reductions, otherwise 2,048."""
+        if register_intensive or (device_major is not None and device_major >= 10):
+            return 1024
+        return 2048
+
+    def get_capped_grid_extra_configs(
+        self,
+        *,
+        size_hints: dict[str, int],
+        inductor_meta: dict[str, Any],
+        triton_meta: dict[str, Any],
+    ) -> list[Config]:
+        """Extra configs for a looped reduction on a capped grid, added to get_configs'.
+
+        The default gives XBLOCK 1 with R0_BLOCK 4,096 for rows wider than 2,048
+        elements and 8,192 for rows wider than 4,096; none for strided rows, more than
+        one reduction dimension or where get_configs' default R0_BLOCK limit is 1,024.
+        """
+        from torch._inductor.runtime.triton_heuristics import (
+            get_total_reduction_numel,
+            triton_config_reduction,
+        )
+
+        loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
+            "num_reduction", 0
+        )
+        register_intensive = self._register_intensive(size_hints, loads_and_red)
+        if (
+            "r1_" in size_hints
+            or inductor_meta.get("reduction_hint")
+            in (ReductionHint.OUTER, ReductionHint.OUTER_TINY)
+            or self._default_max_r0_block(
+                triton_meta["device"].major, register_intensive
+            )
+            < 2048
+        ):
+            return []
+        rnumel = get_total_reduction_numel(size_hints)
+        # 16 warps (8 on 64-lane GPUs), as triton_config_reduction picks for these
+        # blocks: one warp per 128 elements, at most 16 up to an R0_BLOCK of 8,192
+        return [
+            triton_config_reduction(
+                size_hints,
+                1,
+                r0_block,
+                num_warps=16,
+                warp_size=triton_meta["device"].warp_size_or_default,
+            )
+            for r0_block in (4096, 8192)
+            if rnumel >= r0_block
+        ]
 
     def get_persistent_configs(
         self,
