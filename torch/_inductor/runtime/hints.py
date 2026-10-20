@@ -11,6 +11,8 @@ from torch.utils._triton import has_triton_package
 
 
 # The following maximums only apply to runtime autotuning, when using FixedTritonConfig one may see larger values
+# A capped kernel's XBLOCK may exceed TRITON_MAX_BLOCK["X"] (see InductorMeta's
+# grid_max_xblock).
 # NOTE: if these fail asserts submit a PR to increase them
 TRITON_MAX_BLOCK = {
     "X": 8192 if torch.version.hip else 4096,
@@ -378,6 +380,12 @@ class InductorMeta(typing.TypedDict, total=False):
     strict_reduction_rblock: int
     kernel_num_gb: float
     kernel_flop: int
+    # Capped launch grid (grid_type CappedGrid1D): grid_cap, at least 1, is the most
+    # programs it launches; grid_max_xblock, a power of 2, limits the default pointwise
+    # candidates' XBLOCK before any raise for min_elem_per_thread.
+    # check_capped_grid_config states the rule for every XBLOCK.
+    grid_cap: int
+    grid_max_xblock: int
 
     # Kernel identity / launch (codegen_kernel literal)
     grid_type: str

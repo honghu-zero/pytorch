@@ -160,6 +160,33 @@ class CodegenConfigHeuristics:
     def get_configs(self, *args: Any, **kwargs: Any) -> list[Any]:
         raise NotImplementedError
 
+    # Hooks for a kernel on a capped grid (CappedGrid1D), asked through
+    # capped_grid_hook_configs; neither gives configs by default
+
+    def get_capped_grid_configs(
+        self,
+        *,
+        size_hints: dict[str, int],
+        inductor_meta: dict[str, Any],
+        triton_meta: dict[str, Any],
+        min_elem_per_thread: int = 0,
+    ) -> list[Any]:
+        """A pointwise kernel's configs, replacing get_configs' if there are any. Each
+        should give every thread at least min_elem_per_thread elements where the size
+        hint allows, as fp8 conversions need them."""
+        return []
+
+    def get_capped_grid_extra_configs(
+        self,
+        *,
+        size_hints: dict[str, int],
+        inductor_meta: dict[str, Any],
+        triton_meta: dict[str, Any],
+    ) -> list[Any]:
+        """A looped reduction's extra configs, added to get_configs' unless they would
+        not be timed: under a strict R0_BLOCK or the determinism filter."""
+        return []
+
 
 def register_codegen_heuristic(
     name: str,
