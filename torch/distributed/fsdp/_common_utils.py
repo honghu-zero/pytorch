@@ -223,6 +223,7 @@ class _FSDPDeviceHandle:
 
     # Return these backend modules directly to avoid proxy overhead.
     # Other backends are accessed through the device-handle proxy.
+    # register/unregister are intended for import-time, single-threaded setup.
     _FAST_PATH_BACKENDS: set[str] = {"cuda", "mtia"}
 
     def __init__(self, device: torch.device, backend: Any = None):
@@ -236,20 +237,19 @@ class _FSDPDeviceHandle:
                 ) from exc
         else:
             self.__backend = backend
+            self.__device = device
 
     @classmethod
     def register_fast_path_backend(cls, device_type: str) -> None:
         """
         Register a device type whose backend module is returned directly.
-
-        The backend must be registered as ``torch.<device_type>`` and
-        provide the device operations required by FSDP. This method does
-        not validate the backend or its interfaces.
-
-        Registration only affects subsequent ``from_device`` calls.
-        Subclasses inherit registrations until they modify their own
-        registry.
+        The backend must already be registered as ``torch.<device_type>``.
         """
+        if not hasattr(torch, device_type):
+            raise AttributeError(
+                f"Device type '{device_type}' does not have a corresponding backend "
+                f"registered as 'torch.{device_type}'."
+            )
         cls._FAST_PATH_BACKENDS = cls._FAST_PATH_BACKENDS | {device_type}
 
     @classmethod

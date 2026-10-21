@@ -237,12 +237,27 @@ class TestFSDPDeviceHandle(TestCase):
         with self.assertRaisesRegex(AttributeError, "registered as 'torch.meta'"):
             _FSDPDeviceHandle(torch.device("meta"))
 
+    def test_explicit_backend_construction(self):
+        handle = _FSDPDeviceHandle(torch.device("cpu"), backend=torch.cpu)
+        self.assertIs(handle.synchronize, torch.cpu.synchronize)
+        with self.assertRaisesRegex(
+            AttributeError, "Custom backend 'cpu' not implement"
+        ):
+            handle.no_such_attr
+
     def test_register_and_unregister_fast_path_backend(self):
         device = torch.device("cpu")
         _FSDPDeviceHandle.register_fast_path_backend("cpu")
         self.assertIs(_FSDPDeviceHandle.from_device(device), torch.cpu)
         _FSDPDeviceHandle.unregister_fast_path_backend("cpu")
         self.assertIsInstance(_FSDPDeviceHandle.from_device(device), _FSDPDeviceHandle)
+
+    def test_register_missing_backend_module_raises(self):
+        with self.assertRaisesRegex(AttributeError, "registered as 'torch.meta'"):
+            _FSDPDeviceHandle.register_fast_path_backend("meta")
+        self.assertEqual(
+            _FSDPDeviceHandle._FAST_PATH_BACKENDS, self._orig_fast_path_backends
+        )
 
     def test_unregister_unregistered_backend_is_noop(self):
         _FSDPDeviceHandle.unregister_fast_path_backend("meta")
